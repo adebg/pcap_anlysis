@@ -15,6 +15,9 @@ Verdicts:
   established-before    data flow whose SYN predates the capture
   orphan SYN-ACK        SYN-ACK with no matching SYN in the capture
   bare RST              RST with no SYN/SYN-ACK in the capture
+  teardown-only         only FIN/ACK segments captured; handshake and data
+                        happened before the capture started
+  undetermined          nothing that identifies the flow's state
 
 Also detects TCP retransmissions per flow (see find_retransmissions):
   - data/SYN retransmissions: same sequence number re-sent in the same
@@ -55,6 +58,20 @@ PATH = _ARGS[0] if _ARGS else "FPX-VM16-Test2-port2_root.pcap"
 # frames seen within DUP_WINDOW seconds down to a single copy.
 DEDUP = "--dedup" in _FLAGS
 DUP_WINDOW = 0.002
+
+
+def _int_opt(name, default=None):
+    for f in _FLAGS:
+        if f.startswith(name + "="):
+            try:
+                return int(f.split("=", 1)[1])
+            except ValueError:
+                return default
+    return default
+
+
+# --stream=N: dump every packet of that TCP stream (Wireshark's tcp.stream)
+STREAM_FILTER = _int_opt("--stream")
 DATA = open(PATH, "rb").read()
 
 
@@ -190,7 +207,7 @@ def new_dir():
             "keepalive": 0}
 
 
-def track_seq(d, frame, ts, di, seq, payload, is_syn):
+def track_seq(d, frame, ts, di, seq, payload, is_syn, is_fin):
     """Track sequence coverage for one direction of a flow.
 
     Works in absolute 64-bit sequence space anchored at the first observed
@@ -198,9 +215,10 @@ def track_seq(d, frame, ts, di, seq, payload, is_syn):
     whose [start, end) range overlaps space already covered counts as a
     retransmission; a segment that starts beyond current coverage counts as
     out-of-order. Covered ranges are kept as merged intervals, so a late
-    gap-filler is NOT mislabeled as a retransmission.
+    gap-filler is NOT mislabeled as a retransmission. SYN and FIN each
+    consume one sequence number, so retransmitted FINs are caught too.
     """
-    adv = payload + (1 if is_syn else 0)        # SYN consumes one sequence number
+    adv = payload + (1 if is_syn else 0) + (1 if is_fin else 0)
     if d["base"] is None:
         d["base"] = seq
         d["next"] = seq + adv
@@ -270,6 +288,15 @@ def parse_tcp(p, ts, src, dst, frame):
     is_syn, is_ack = flags & SYN, flags & ACK
     is_rst, is_fin = flags & RST, flags & FIN
 
+    if STREAM_FILTER is not None and f["stream"] == STREAM_FILTER:
+        # per-packet log for the --stream dump (payload preview only)
+        f.setdefault("pktlog", []).append({
+            "frame": frame, "ts": ts, "src": src, "sport": sport,
+            "dst": dst, "dport": dport, "seq": seq, "ack": acknum,
+            "flags": flags, "len": payload, "win": struct.unpack_from(">H", p, 14)[0],
+            "data": p[doff:doff + payload] if payload else b"",
+        })
+
     # pin the client/server roles as early as possible (first SYN, or a
     # SYN-ACK whose SYN we missed, or the sorted tuple as a provisional
     # fallback that is re-pinned on the first SYN-ish packet)
@@ -302,20 +329,21 @@ def parse_tcp(p, ts, src, dst, frame):
         acks.append(acknum)
 
     # ---- retransmission / sequence tracking (per direction) ----
-    # a SYN consumes one sequence number; pure ACKs do not advance.
+    # SYN and FIN each consume one sequence number; pure ACKs do not advance.
     d = f["dir"][di]
     is_keepalive = False
     if d["next"] is not None and is_ack and not is_syn and not is_rst \
             and not is_fin and payload <= 1:
         start = d["base"] + ((seq - d["base"]) & 0xFFFFFFFF)
+        # keepalive probe (RFC 1122 4.2.3.6), Wireshark's tcp.analysis.keep_alive
+        # pattern: ACK, payload of 0 or 1 byte, sequence number one below the
+        # next expected one. A normal pure ACK sits exactly at next.
         if start == d["next"] - 1:
-            # keepalive probe (RFC 1122 4.2.3.6): re-sends the last octet,
-            # 0 or 1 byte, seq = next - 1. NOT a retransmission, NOT a dup ACK.
             is_keepalive = True
     if is_keepalive:
         d["keepalive"] += 1
-    elif payload or is_syn:
-        track_seq(d, frame, ts, di, seq, payload, is_syn)
+    elif payload or is_syn or is_fin:
+        track_seq(d, frame, ts, di, seq, payload, is_syn, is_fin)
     elif is_ack and not is_rst and not is_fin:
         # duplicate ACK (same ack number, no payload) - fast-retransmit trigger
         if d["last_ack"] == acknum:
@@ -546,6 +574,10 @@ def classify(f):
         return "established-before-capture"
     if f["client_rst"] or f["server_rst"]:
         return "bare RST"
+    if f["client_fin"] or f["server_fin"]:
+        # only FIN/ACK segments captured: the handshake and any data
+        # happened before the capture started
+        return "teardown-only"
     return "undetermined"
 
 
@@ -694,3 +726,82 @@ if len(flows) <= 200:
               (r["stream"], "%d..%d" % (r["f0"], r["f1"]), r["client"], r["server"], r["v"],
                r["pkts"], r["cr"] + r["sr"],
                r.get("retx", 0), r["c2s"], r["s2c"], ts2str(r["t0"])))
+
+# ------------------------------------------------------------ per-stream dump
+FLAG_NAMES = ((0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"), (0x08, "PSH"),
+              (0x10, "ACK"), (0x20, "URG"), (0x40, "ECE"), (0x80, "CWR"))
+
+
+def flag_str(flags):
+    return ",".join(n for bit, n in FLAG_NAMES if flags & bit) or "-"
+
+
+def payload_preview(data, limit=200):
+    if not data:
+        return ""
+    try:
+        text = data.decode("ascii")
+        if all(32 <= ord(ch) < 127 or ch in "\r\n\t" for ch in text):
+            shown = text.replace("\r\n", "\\r\\n").replace("\n", "\\n").replace("\t", "\\t")
+            return shown[:limit] + ("..." if len(shown) > limit else "")
+    except UnicodeDecodeError:
+        pass
+    return data[:64].hex(" ") + ("..." if len(data) > 64 else "")
+
+
+if STREAM_FILTER is not None:
+    print("\n" + "=" * 104)
+    print("TCP STREAM %d (Wireshark: tcp.stream eq %d)" % (STREAM_FILTER, STREAM_FILTER))
+    print("=" * 104)
+    target = next((fl for fl in flows.values() if fl["stream"] == STREAM_FILTER), None)
+    if target is None:
+        print("  no such stream in this capture (streams 0..%d)" % (len(flows) - 1))
+    else:
+        c = target["client"]
+        s = target["server"]
+        log = target.get("pktlog", [])
+        c2s_pkts = [r for r in log if (r["src"], r["sport"]) == c]
+        s2c_pkts = [r for r in log if (r["src"], r["sport"]) == s]
+        print("  endpoints : %s  <->  %s" % (ep(*c), ep(*s)))
+        print("  verdict   : %s" % classify(target))
+        print("  frames    : #%d .. #%d   |  first %s  |  last %s  |  duration %.6f s"
+              % (target["first_frame"], target["last_frame"], ts2str(target["first"]),
+                 ts2str(target["last"]), target["last"] - target["first"]))
+        print("  packets   : %d  (client->server %d pkts / %d B, server->client %d pkts / %d B)"
+              % (len(log), len(c2s_pkts), sum(r["len"] for r in c2s_pkts),
+                 len(s2c_pkts), sum(r["len"] for r in s2c_pkts)))
+        print("  handshake : SYN %d, SYN-ACK %d, final ACK %s, RST %d/%d, FIN %d/%d"
+              % (target["client_syn"], target["server_synack"],
+                 "yes" if target["final_ack"] else "no",
+                 target["client_rst"], target["server_rst"],
+                 target["client_fin"], target["server_fin"]))
+        d = target["dir"]
+        print("  analysis  : retx %d (%d B), dup ACKs %d, out-of-order %d, keepalives %d"
+              % (d["c2s"]["retx"] + d["s2c"]["retx"],
+                 d["c2s"]["retx_bytes"] + d["s2c"]["retx_bytes"],
+                 d["c2s"]["dup_acks"] + d["s2c"]["dup_acks"],
+                 d["c2s"]["oo"] + d["s2c"]["oo"],
+                 d["c2s"]["keepalive"] + d["s2c"]["keepalive"]))
+        if not target["client_syn"] and not target["server_synack"]:
+            print("  note      : no handshake in the capture; these segments belong to a")
+            print("              connection whose SYN (and any early data) predates frame #%d"
+                  % target["first_frame"])
+        if not log:
+            print("  no packets recorded for this stream")
+        print("-" * 104)
+        print("%-7s %-12s %-5s %-38s %-12s %-11s %-11s %5s %6s" %
+              ("frame", "time", "dir", "endpoints", "flags", "seq", "ack", "len", "win"))
+        for r in log:
+            c2s = (r["src"], r["sport"]) == c
+            if c2s:
+                arrow, endpoints = "c->s", "%-16s -> %s" % (
+                    "%s:%d" % (r["src"], r["sport"]), "%s:%d" % (r["dst"], r["dport"]))
+            else:
+                arrow, endpoints = "s->c", "%-16s -> %s" % (
+                    "%s:%d" % (r["src"], r["sport"]), "%s:%d" % (r["dst"], r["dport"]))
+            print("#%-6d %-12s %-5s %-38s %-12s %-11u %-11u %5d %6d"
+                  % (r["frame"], ts2str(r["ts"]), arrow, endpoints, flag_str(r["flags"]),
+                     r["seq"], r["ack"], r["len"], r["win"]))
+            if r["len"]:
+                print("        %s" % payload_preview(r["data"]))
+
